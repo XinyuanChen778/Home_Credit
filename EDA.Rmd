@@ -1,0 +1,377 @@
+---
+title: "EDA"
+author: "Xinyuan Chen"
+date: "2025-02-16"
+output: 
+  html_document:
+    theme: simplex
+    code_folding: 
+    toc: yes
+    toc_float:
+      collapsed: true
+---
+# Introduction
+
+## Business Problem
+Home Credit Group provides financial services to people who may not have a traditional credit history, making it difficult to determine whether they can repay a loan. Without standard credit data, lenders risk making the wrong decisions—either approving loans for people who might default or rejecting creditworthy applicants who could have successfully repaid. The goal of this project is to build a predictive model that helps predict an applicants' ability to repay, allowing for smarter and fairer lending decisions.
+
+## Analytic Problems
+To make accurate predictions, we need to analyze multiple datasets, including information about current loan applications, past loans with Home Credit, and external credit history from other financial institutions. These datasets contain valuable insights into applicants’ financial behavior, such as how they have managed previous loans, their payment patterns, and their overall credit utilization. The challenge is to clean and combine this data, handle missing values, and extract meaningful patterns that will help the model make better lending decisions.
+
+## Questions and Purpose
+Before building the model, it is necessary to explore the data to understand its structure and key trends. This includes checking for missing values, analyzing applicant financial behavior, and identifying which factors influence loan repayment.
+
+Key Questions:
+
+- **How do income and credit amount affect loan repayment?**  
+- **What patterns exist in past loan approvals and defaults?**  
+- **How does an applicant’s credit history impact repayment?**  
+- **Are there correlations between key financial indicators?**  
+
+The ultimate purpose of this EDA notebook is to refine the data and build a more effective model that improves loan approvals while reducing financial risk.
+
+# Description of the Data
+
+## Data Import
+```{r message=FALSE, warning=FALSE}
+# Load Library
+library(readr)
+library(dplyr) 
+library(ggplot2)
+library(skimr)
+library(corrplot)
+library(VIM) 
+library(knitr)
+library(DT) 
+library(corrr)
+library(reshape2)
+
+setwd("/Users/chenxinyuan/Documents/Project Practice - Capstone/Home Credit/Home_Credit")
+```
+
+```{r message=FALSE, warning=FALSE}
+application_train <- read_csv("application_train.csv")
+application_test <- read_csv("application_test.csv")
+bureau <- read_csv("bureau.csv")
+bureau_balance <- read_csv("bureau_balance.csv")
+previous_application <- read_csv("previous_application.csv")
+POS_CASH_balance <- read_csv("POS_CASH_balance.csv")
+installments_payments <- read_csv("installments_payments.csv")
+credit_card_balance <- read_csv("credit_card_balance.csv")
+```
+
+## Explor Data Size
+```{r message=FALSE, warning=FALSE}
+sizes <- data.frame(
+  Dataset = c("application_train", "bureau", "bureau_balance", 
+              "previous_application", "POS_CASH_balance", 
+              "installments_payments", "credit_card_balance","application_test"),
+  Rows = c(nrow(application_train), nrow(bureau), nrow(bureau_balance), 
+           nrow(previous_application), nrow(POS_CASH_balance), 
+           nrow(installments_payments), nrow(credit_card_balance),nrow(application_test)),
+  Columns = c(ncol(application_train), ncol(bureau), ncol(bureau_balance), 
+              ncol(previous_application), ncol(POS_CASH_balance), 
+              ncol(installments_payments), ncol(credit_card_balance),ncol(application_test))
+)
+print(sizes)
+```
+The dataset has several tables, with `application_train` (307K rows, 122 columns) as the main file containing loan details and repayment status. The largest dataset is `bureau_balance` (27.3M rows), which tracks past credit history, making it complex to handle.
+
+Key datasets for predicting loan repayment include `application_train|tesr`, `bureau`, `previous_application`, `installments_payments`, and `credit_card_balance`, as they contain financial and payment behavior. Challenges include handling large datasets, merging multiple tables, dealing with missing values, and extracting useful features for better predictions.
+
+## Number of Unqiue Values
+```{r message=FALSE, warning=FALSE}
+unique_counts <- data.frame(
+  Dataset = c("application_train", "application_test", "bureau", "previous_application", "installments_payments", "credit_card_balance"),
+  Unique_SK_ID_CURR = c(length(unique(application_train$SK_ID_CURR)), 
+                         length(unique(application_test$SK_ID_CURR)), 
+                         length(unique(bureau$SK_ID_CURR)), 
+                         length(unique(previous_application$SK_ID_CURR)), 
+                         length(unique(installments_payments$SK_ID_CURR)), 
+                         length(unique(credit_card_balance$SK_ID_CURR)))
+)
+print(unique_counts)
+```
+## Explore Target Variable
+```{r message=FALSE, warning=FALSE}
+target_distribution <- table(application_train$TARGET)
+print(target_distribution)
+```
+
+```{r message=FALSE, warning=FALSE}
+ggplot(application_train, aes(x = as.factor(TARGET))) +
+  geom_bar(fill = "indianred4") +
+  labs(title = "Loan Repayment vs. Default", x = "TARGET (0 = Repaid, 1 = Defaulted)", y = "Count") +
+  theme_minimal()
+
+```
+The dataset is imbalanced, with large repaid loans and small defaults. This means the model might focus too much on repaid loans and miss high-risk applicants. If not handled, it could lead to more loan defaults and financial losses. To fix this, techniques like oversampling or adjusting model training might applied.
+
+
+# Discussion of Missing Data
+
+## Check Misssing Value
+```{r message=FALSE, warning=FALSE}
+missing_values <- function(df) {
+  missings <- colSums(is.na(df)) / nrow(df) * 100
+  return(data.frame(Column = names(missings), Missing_Percentage = missings))
+}
+
+missing_summary <- list(
+  application_train = missing_values(application_train),
+  application_test = missing_values(application_test),
+  bureau = missing_values(bureau),
+  bureau_balance = missing_values(bureau_balance),
+  previous_application = missing_values(previous_application),
+  installments_payments = missing_values(installments_payments),
+  credit_card_balance = missing_values(credit_card_balance)
+)
+
+# display 
+for (name in names(missing_summary)) {
+  cat("\nMissing values in", name, ":\n")
+  print(missing_summary[[name]] %>% filter(Missing_Percentage > 0) %>% arrange(desc(Missing_Percentage)))
+}
+```
+
+## Remove Columns with Too Many Missing Values
+```{r message=FALSE, warning=FALSE}
+# Function to remove columns with high missing percentage
+remove_high_missing <- function(df, threshold = 50) {
+  missing_perc <- colSums(is.na(df)) / nrow(df) * 100
+  cols_to_keep <- names(missing_perc[missing_perc < threshold])
+  return(df[, cols_to_keep])
+}
+
+
+application_train <- remove_high_missing(application_train)
+application_test <- remove_high_missing(application_test)
+bureau <- remove_high_missing(bureau)
+previous_application <- remove_high_missing(previous_application)
+credit_card_balance <- remove_high_missing(credit_card_balance)
+POS_CASH_balance <- remove_high_missing(POS_CASH_balance)
+installments_payments <- remove_high_missing(installments_payments)
+```
+
+## Fill Numeric Columns with Mean/Median
+```{r message=FALSE, warning=FALSE}
+# Function to fill missing values with median
+fill_missing_numeric <- function(df) {
+  for (col in colnames(df)) {
+    if (is.numeric(df[[col]])) {
+      df[[col]][is.na(df[[col]])] <- median(df[[col]], na.rm = TRUE)
+    }
+  }
+  return(df)
+}
+
+application_train <- fill_missing_numeric(application_train)
+application_test <- fill_missing_numeric(application_test)
+bureau <- fill_missing_numeric(bureau)
+previous_application <- fill_missing_numeric(previous_application)
+credit_card_balance <- fill_missing_numeric(credit_card_balance)
+POS_CASH_balance <- fill_missing_numeric(POS_CASH_balance)
+installments_payments <- fill_missing_numeric(installments_payments)
+```
+
+## Fill Categorical Columns with Most Frequent Value
+```{r message=FALSE, warning=FALSE}
+# Function to fill missing categorical values with the most frequent category
+fill_missing_categorical <- function(df) {
+  for (col in colnames(df)) {
+    if (is.character(df[[col]])) {
+      most_frequent <- names(sort(table(df[[col]]), decreasing = TRUE))[1]
+      df[[col]][is.na(df[[col]])] <- most_frequent
+    }
+  }
+  return(df)
+}
+
+# Apply to datasets
+application_train <- fill_missing_categorical(application_train)
+application_test <- fill_missing_categorical(application_test)
+previous_application <- fill_missing_categorical(previous_application)
+```
+
+## No Missing Values Left
+```{r message=FALSE, warning=FALSE}
+check_missing <- function(df, name) {
+  missing_count <- sum(is.na(df))
+  cat(name, "- Remaining Missing Values:", missing_count, "\n")
+}
+
+check_missing(application_train, "application_train")
+check_missing(application_test, "application_test")
+check_missing(bureau, "bureau")
+check_missing(previous_application, "previous_application")
+check_missing(credit_card_balance, "credit_card_balance")
+check_missing(POS_CASH_balance, "POS_CASH_balance")
+check_missing(installments_payments, "installments_payments")
+```
+
+
+
+# Exploratory Visualizations and/or Summary Tables
+
+## Visualize Differences in Income & Loan Amount
+```{r message=FALSE, warning=FALSE}
+ggplot(application_train, aes(x = as.factor(TARGET), y = AMT_INCOME_TOTAL)) +
+  geom_boxplot(fill = "indianred4", outlier.shape = NA) +
+  scale_y_continuous(limits = quantile(application_train$AMT_INCOME_TOTAL, c(0.01, 0.99), na.rm = TRUE)) + # Remove extreme outliers
+  labs(title = "Income Distribution by Loan Repayment", x = "TARGET (0 = Repaid, 1 = Defaulted)", y = "Income") +
+  theme_minimal()
+```
+
+```{r message=FALSE, warning=FALSE}
+ggplot(application_train, aes(x = as.factor(TARGET), y = AMT_CREDIT)) +
+  geom_boxplot(fill = "indianred4", outlier.shape = NA) +
+  scale_y_continuous(limits = quantile(application_train$AMT_CREDIT, c(0.01, 0.99), na.rm = TRUE)) + # Remove extreme outliers
+  labs(title = "Loan Amount Distribution by Loan Repayment", x = "TARGET (0 = Repaid, 1 = Defaulted)", y = "Loan Amount") +
+  theme_minimal()
+```
+The boxplots show that income and loan amount distributions are very similar for both repaid and defaulted loans. While defaulted applicants tend to have a slightly lower median income, there are large outliers, indicating that some applicants have very high incomes. Similarly, loan amounts for both groups show a wide range, with defaulted applicants having a slightly lower median loan amount. However, these differences are not significant, suggesting that income alone is not a strong predictor of loan repayment. To better understand default risks, we need to analyze other financial behaviors like past credit history and payment patterns.
+
+## Financial Behavior Analysis
+- **Check how many applicants had previous loans from other financial institutions.**
+- **Calculate the average number of past credits per applicant.**
+```{r message=FALSE, warning=FALSE}
+# Count applicants with previous loans
+applicants_with_external_loans <- bureau %>%
+  group_by(SK_ID_CURR) %>%
+  summarise(num_past_loans = n()) %>%
+  filter(num_past_loans > 0)
+
+# Number of applicants with external loans
+num_applicants_with_loans <- n_distinct(applicants_with_external_loans$SK_ID_CURR)
+cat("Number of applicants with previous external loans:", num_applicants_with_loans, "\n")
+
+# Average number of past credits per applicant
+avg_past_credits <- mean(applicants_with_external_loans$num_past_loans)
+cat("Average number of past credits per applicant:", avg_past_credits, "\n")
+```
+## Analyzing Payment Behavior
+```{r message=FALSE, warning=FALSE}
+# Late or missed payments in credit card balance
+late_credit_payments <- credit_card_balance %>%
+  filter(AMT_PAYMENT_CURRENT < AMT_INST_MIN_REGULARITY) %>%
+  group_by(SK_ID_CURR) %>%
+  summarise(num_late_payments = n())
+
+# Late or missed payments in installments
+late_installments <- installments_payments %>%
+  filter(DAYS_ENTRY_PAYMENT > DAYS_INSTALMENT) %>%
+  group_by(SK_ID_CURR) %>%
+  summarise(num_late_installments = n())
+
+# POS_CASH_balance - Count overdue payments
+overdue_POS <- POS_CASH_balance %>%
+  filter(SK_DPD > 0) %>%
+  group_by(SK_ID_CURR) %>%
+  summarise(num_overdue_POS = n())
+
+# Avg missed payments per applicant
+avg_late_credit <- mean(late_credit_payments$num_late_payments, na.rm = TRUE)
+avg_late_installments <- mean(late_installments$num_late_installments, na.rm = TRUE)
+avg_overdue_POS <- mean(overdue_POS$num_overdue_POS, na.rm = TRUE)
+
+cat("Average number of late credit card payments:", avg_late_credit, "\n")
+cat("Average number of late installment payments:", avg_late_installments, "\n")
+cat("Average number of overdue POS payments:", avg_overdue_POS, "\n")
+
+```
+
+## Check Number of Previous Loans Defaulted Applicants Had.
+```{r message=FALSE, warning=FALSE}
+defaulted_previous_loans <- previous_application %>%
+  inner_join(application_train %>% filter(TARGET == 1), by = "SK_ID_CURR") %>%
+  group_by(SK_ID_CURR) %>%
+  summarise(num_previous_loans = n())
+
+# Average number of previous loans for defaulted applicants
+avg_previous_loans_defaulted <- mean(defaulted_previous_loans$num_previous_loans)
+cat("Average number of previous loans for defaulted applicants:", avg_previous_loans_defaulted, "\n")
+
+```
+## Feature Engineer 
+
+### Credit Utilization Rate
+This feature can helps measure how much of the available credit an applicant is using.
+```{r message=FALSE, warning=FALSE}
+# Credit utilization
+credit_utilization <- credit_card_balance %>%
+  group_by(SK_ID_CURR) %>%
+  summarise(credit_utilization = mean(AMT_BALANCE / AMT_CREDIT_LIMIT_ACTUAL, na.rm = TRUE))
+
+```
+### Late Payment Ratio
+```{r message=FALSE, warning=FALSE}
+# Count late payments
+late_payment_ratio <- installments_payments %>%
+  mutate(late = ifelse(DAYS_ENTRY_PAYMENT > DAYS_INSTALMENT, 1, 0)) %>%
+  group_by(SK_ID_CURR) %>%
+  summarise(late_payment_ratio = mean(late, na.rm = TRUE))
+```
+### Previous Loan Approval Rate
+```{r message=FALSE, warning=FALSE}
+approval_rate <- previous_application %>%
+  mutate(approved = ifelse(NAME_CONTRACT_STATUS == "Approved", 1, 0)) %>%
+  group_by(SK_ID_CURR) %>%
+  summarise(approval_rate = mean(approved, na.rm = TRUE))
+```
+### Average Overdue Days
+```{r message=FALSE, warning=FALSE}
+avg_overdue_days <- POS_CASH_balance %>%
+  group_by(SK_ID_CURR) %>%
+  summarise(avg_overdue_days = mean(SK_DPD, na.rm = TRUE))
+```
+### Merge into Main data set
+```{r message=FALSE, warning=FALSE}
+# Merge features with application_train
+application_train <- application_train %>%
+  left_join(credit_utilization, by = "SK_ID_CURR") %>%
+  left_join(late_payment_ratio, by = "SK_ID_CURR") %>%
+  left_join(approval_rate, by = "SK_ID_CURR") %>%
+  left_join(avg_overdue_days, by = "SK_ID_CURR")
+```
+## Correlation Analysis 
+```{r message=FALSE, warning=FALSE}
+# select variables for correlation
+financial_features <- application_train %>%
+  select(TARGET, AMT_INCOME_TOTAL, AMT_CREDIT, credit_utilization, 
+         late_payment_ratio, approval_rate, avg_overdue_days) 
+
+cor_matrix <- correlate(financial_features, use = "pairwise.complete.obs")
+
+
+print(cor_matrix %>% focus(TARGET))
+```
+```{r message=FALSE, warning=FALSE}
+cor_matrix <- cor(financial_features, use = "pairwise.complete.obs", method = "pearson")
+
+# Convert to a data frame and keep row/column names
+cor_df <- as.data.frame(cor_matrix)
+cor_df$Feature <- rownames(cor_df)  # Add row names as a column
+
+# Reshape correlation matrix for ggplot
+cor_data <- melt(cor_df, id.vars = "Feature", variable.name = "Feature2", value.name = "Correlation")
+
+# Heatmap of correlation matrix
+ggplot(cor_data, aes(x = Feature, y = Feature2, fill = Correlation)) +
+  geom_tile(color = "white") +
+  scale_fill_gradient2(low = "blue", mid = "white", high = "red", midpoint = 0) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "Correlation Heatmap", x = "Features", y = "Features", fill = "Correlation")
+
+```
+The heatmap shows that late payment ratio and average overdue days have a positive correlation with loan default, meaning higher values increase risk. Approval rate is negatively correlated, which means applicants with more past loan approvals are less likely to default. Income, loan amount, and credit utilization have weak or no correlation with repayment behavior, making them poor predictors. Based on this, we should keep late payment ratio, overdue days, and approval rate, while dropping weak features like income, loan amount, and credit utilization to improve model efficiency.
+
+# Results section
+
+The analysis found a significant class imbalance in the dataset, with 91.9% of applicants repaying loans and only 8.1% defaulting. This imbalance may affect model performance and requires techniques to ensure fair predictions.
+
+The financial behavior analysis showed that many applicants had previous loans, and those who defaulted often had multiple past loans with late or missed payments. Credit utilization and overdue payments were more common among defaulters, suggesting these factors may indicate higher risk.
+
+In the correlation analysis, late payment ratio and average overdue days showed a positive correlation with default risk, meaning higher values increase the chance of default. Approval rate had a negative correlation, suggesting that applicants with more past loan approvals were less likely to default. Income, loan amount, and credit utilization had weak or no correlation, making them poor predictors of repayment behavior.
+
+To improve model performance, I would like to fucus more on late payment ratio, overdue days, and approval rate, while removing weak features like income, loan amount, and credit utilization. The next step is to apply feature importance analysis using predictive models to refine feature selection and enhance prediction accuracy.

@@ -1,0 +1,890 @@
+---
+title: "Home Credit Modeling"
+author: "Xinyuan Chen, Sterling LeDuc, Robby Stohel"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    theme: simplex
+    code_folding: 
+    toc: yes
+    toc_float:
+      collapsed: true
+---
+
+```{r setup, include=FALSE}
+# Set global chunk options for knitr
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+
+# Load required libraries
+library(dplyr)
+library(tidyr) # For replace_na()
+library(skimr) # For skim()
+library(caret) # For dataset partitioning
+library(data.table) # For corr matrix 'with = FALSE'
+library(pROC)
+library(xgboost)
+library(ggplot2)
+library(ROSE)
+library(rminer)
+
+# Read training and test datasets
+train <- read.csv("application_train.csv")
+test <- read.csv("application_test.csv")
+```
+
+
+# Introduction
+
+In this project, my team and I are tackling the challenge of assessing loan default risk using a dataset provided by a Kaggle competition. Our objective is to build a predictive model that can accurately determine the likelihood of loan default based on a variety of features, such as demographic and financial information. To achieve this, we will follow a structured approach that includes thorough data cleaning, feature engineering, and model selection. By experimenting with different modeling techniques, we aim to develop a model that not only performs well on training data but also generalizes effectively to unseen data, ultimately providing valuable insights into the risk of loan defaults. 
+
+This model has the potential to solve Home Credit Group's business problem by helping them make smarter, more informed lending decisions. Home Credit provides financial services to individuals without a traditional credit history, making it difficult to assess their ability to repay loans. By predicting applicants' repayment ability, this model will enable more accurate lending decisions, reducing the risk of defaults and preventing the rejection of creditworthy applicants.
+
+### Helper Functions
+
+In this section, we implemented a series of data cleaning functions based on the rules determined during our exploratory data analysis (EDA). These rules focus on standardizing variable formats, handling missing values, and addressing potential imbalances in the dataset. Here's a summary of the changes made by each function:
+
+- **`order_columns`**: Reorders the columns of the dataframe alphabetically for consistency.
+
+- **`quick_clean`**: 
+  - Converts character columns with specific values ("N", "Y", "") into factors with labels "No" and "Yes."
+  - Ensures consistent factor levels for character columns with values "Yes" and "No."
+  - Converts numeric columns with values 0 and 1 into factors labeled "No" and "Yes."
+  - Applies factor conversion to all character columns, skipping any specified in the `skip_columns` argument.
+  - Replaces missing values (NA) in numeric columns with 0.0. However, additional imputations are performed below on some numeric predictors where defaulting to 0.0 didn't make sense (e.g., predictors with specific patterns or meaningful values) to ensure better handling of missing data.
+
+- **`filter_low_variability`**: 
+  - Filters out columns with high missing percentages or imbalance, based on a threshold (default 50%). The function calculates the percentage of missing values, zeros, or the most frequent value for each column and removes those with high variability.
+
+- **`validate_imbalances`**:
+  - Summarizes column imbalances, including missing value percentages, zero percentages, and the most frequent value's percentage. It calculates a combined "sum percentage" for numeric columns (missing + zero) and provides this summary to identify problematic columns.
+
+- **`match_factor_levels`**: Ensures that factor levels in the dataset match those in a full reference dataset, maintaining consistency across factor variables.
+
+These functions will be applied to clean and standardize the data before further analysis and model development.
+
+```{r helper_functions}
+# Function to order columns alphabetically in a dataframe
+order_columns <- function(df) {
+  df[, order(names(df))]
+}
+
+# Initial cleaning function based on exploratory data analysis (EDA)
+quick_clean <- function(df, skip_columns = c()) {
+  return(df %>%
+    order_columns() %>%
+    mutate_if(
+      is.character,
+      function(x) if (all(unique(x) %in% c("N", "Y", ""))) 
+        factor(ifelse(x == "Y", "Yes", "No"), levels = c("No", "Yes")) 
+      else x
+    ) %>%
+    mutate_if(
+      is.character,
+      function(x) if (all(unique(x) %in% c("Yes", "No", ""))) 
+        factor(x, levels = c("No", "Yes")) 
+      else x
+    ) %>%
+    mutate_if(
+      is.numeric,
+      function(x) if (all(na.omit(unique(x)) %in% c(0, 1))) 
+        factor(ifelse(x == 1, "Yes", "No"), levels = c("No", "Yes")) 
+      else x
+    ) %>%
+    mutate(across(where(is.character) & !any_of(skip_columns), ~ factor(.))) %>% 
+    mutate(across(where(~ is.numeric(.) | is.integer(.)), ~ replace_na(., 0.0))))
+}
+
+# Function to remove columns with high missing percentages or imbalances
+filter_low_variability <- function(df, threshold = 50, exclude_col = NULL, filter_column = "sum_percentage") {
+  # Identify columns to process (excluding the specified column)
+  cols_to_check <- setdiff(names(df), exclude_col)
+  
+  # Initialize a vector to store variability percentages
+  total_perc <- rep(0, length(cols_to_check))
+  names(total_perc) <- cols_to_check
+  
+  # Loop through each column to calculate its imbalance and missing values
+  for (col in cols_to_check) {
+    column_data <- df[[col]]
+    
+    if (is.factor(column_data) || is.character(column_data)) {
+      # For factor or character columns: Calculate percentage of most frequent value
+      value_counts <- table(column_data, useNA = "ifany")
+      value_perc <- (value_counts / length(column_data)) * 100
+      total_perc[col] <- max(value_perc)
+      
+    } else if (is.numeric(column_data)) {
+      # For numeric columns: Calculate percentage of missing and zero values
+      missing_perc <- sum(is.na(column_data)) / length(column_data) * 100
+      zero_perc <- sum(column_data == 0, na.rm = TRUE) / length(column_data) * 100
+      total_perc[col] <- missing_perc + zero_perc
+    }
+  }
+  
+  # Filter columns based on the threshold (default is sum_percentage)
+  cols_to_keep <- names(total_perc[total_perc < threshold])
+  
+  # If we need to filter on a specific column percentage, apply that filter
+  if (filter_column != "sum_percentage") {
+    cols_to_keep <- names(total_perc[total_perc < threshold & total_perc[filter_column] < threshold])
+  }
+  
+  # Ensure the excluded column is included in the final dataset if it exists
+  final_cols <- unique(c(cols_to_keep, exclude_col))
+  
+  return(df[, final_cols, drop = FALSE])
+}
+
+# Function to validate and summarize column imbalances (missing values, zeros, etc.)
+validate_imbalances <- function(df, threshold = 50, exclude_col = NULL) {
+  # Identify columns to process (excluding the specified column)
+  cols_to_check <- setdiff(names(df), exclude_col)
+  
+  # Initialize a dataframe to store imbalance summary
+  imbalance_summary <- data.frame(
+    column = character(0),
+    missing_percentage = numeric(0),
+    zero_percentage = numeric(0),
+    most_frequent_value = character(0),
+    most_frequent_percentage = numeric(0),
+    sum_percentage = numeric(0),  # New column for the sum
+    stringsAsFactors = FALSE
+  )
+  
+  # Loop through each column to calculate imbalances and proportions
+  for (col in cols_to_check) {
+    column_data <- df[[col]]
+    
+    if (is.factor(column_data) || is.character(column_data)) {
+      # For factor or character columns: Calculate imbalance of unique values
+      value_counts <- table(column_data, useNA = "ifany")
+      value_perc <- round((value_counts / length(column_data)) * 100, 2)
+      
+      # Find most frequent value and its percentage
+      most_frequent_value <- names(value_perc)[which.max(value_perc)]
+      most_frequent_percentage <- max(value_perc)
+      
+      # Add imbalance information to the summary
+      imbalance_summary <- rbind(imbalance_summary,
+        data.frame(
+          column = col,
+          missing_percentage = NA, # Not applicable for factor columns
+          zero_percentage = NA,    # Not applicable for factor columns
+          most_frequent_value = most_frequent_value,
+          most_frequent_percentage = most_frequent_percentage,
+          sum_percentage = most_frequent_percentage # Only include most frequent percentage
+        )
+      )
+      
+    } else if (is.numeric(column_data)) {
+      # For numeric columns: Calculate missing and zero percentages
+      missing_perc <- round(sum(is.na(column_data)) / length(column_data) * 100, 2)
+      zero_perc <- round(sum(column_data == 0, na.rm = TRUE) / length(column_data) * 100, 2)
+      
+      # Calculate sum of missing and zero percentages
+      sum_percentage <- missing_perc + zero_perc
+      
+      # Add imbalance information to the summary
+      imbalance_summary <- rbind(imbalance_summary,
+        data.frame(
+          column = col,
+          missing_percentage = missing_perc,
+          zero_percentage = zero_perc,
+          most_frequent_value = NA,  # Not applicable for numeric columns
+          most_frequent_percentage = NA,
+          sum_percentage = sum_percentage # Sum missing and zero percentages
+        )
+      )
+    }
+  }
+  
+  # Sort the imbalance summary by sum_percentage in descending order
+  imbalance_summary <- imbalance_summary[order(-imbalance_summary$sum_percentage), ]
+  
+  # Convert column names to snake_case
+  names(imbalance_summary) <- gsub("([a-z])([A-Z])", "\\1_\\2", names(imbalance_summary)) # Add underscore before uppercase letters
+  names(imbalance_summary) <- tolower(names(imbalance_summary)) # Convert all to lowercase
+  
+  # Return the imbalance summary
+  return(imbalance_summary)
+}
+
+# Function to match factor levels between data and full dataset
+match_factor_levels <- function(data, full_data) {
+  data %>%
+    mutate(across(where(is.factor), ~ factor(., levels = levels(full_data[[cur_column()]]))))
+}
+```
+
+
+# Prohibited Factors for Loan Decisions
+
+Lending regulations across various countries prohibit the use of certain personal data when making loan decisions to prevent discrimination. The following list aggregates restricted factors from the *United States, Czech Republic, Slovakia, Kazakhstan, China, Vietnam, Air Bank (Czech Republic), India, Indonesia, and the Philippines* **as these locations were listed as areas of operation for Home Credit based on their website**. These regions have laws and regulations that generally prohibit discrimination based on attributes such as race, ethnicity, religion, gender, age, disability, and social status. Below is a combined and de-duplicated list of factors that cannot legally be used to determine loan eligibility, or for our purposes, default risk.  
+
+- **Race**  
+- **Ethnicity**  
+- **Religion or belief**  
+- **Gender**  
+- **Age (unless related to contract capacity)**  
+- **Disability**  
+- **Marital status**  
+- **Nationality or place of birth**  
+- **Social status or caste**  
+- **Receipt of public assistance**  
+- **Language**  
+- **Political beliefs**  
+- **Familial status (in housing-related loans)**  
+- **Exercising consumer protection rights**  
+
+This list provides a broad overview of anti-discrimination factors applicable across multiple jurisdictions. However, specific regulations may vary by country. Using illegal factors in lending decisions can result in lawsuits, regulatory penalties, and reputation damage. As such, we have started by removing potential predictors from our the dataset that could pose future legal concerns for the client.
+
+```{r removing_protected_predictors}
+train <- train %>%
+  select(
+    -CODE_GENDER, 
+    -CNT_CHILDREN, 
+    -NAME_FAMILY_STATUS, 
+    -DAYS_BIRTH, 
+    -DAYS_EMPLOYED, 
+    -CNT_FAM_MEMBERS
+  )
+```
+
+
+# Initial Data Cleaning
+
+```{r initial_data_cleaning}
+# Function to handle missing values by imputing them with appropriate values
+app_imputation <- function(df) {
+  df %>%
+    mutate(
+      APARTMENTS_AVG = replace_na(APARTMENTS_AVG, median(APARTMENTS_AVG, na.rm = TRUE)),
+      APARTMENTS_MEDI = replace_na(APARTMENTS_MEDI, median(APARTMENTS_MEDI, na.rm = TRUE)),
+      APARTMENTS_MODE = replace_na(APARTMENTS_MODE, median(APARTMENTS_MODE, na.rm = TRUE)),
+      BASEMENTAREA_AVG = replace_na(BASEMENTAREA_AVG, median(BASEMENTAREA_AVG, na.rm = TRUE)),
+      BASEMENTAREA_MEDI = replace_na(BASEMENTAREA_MEDI, median(BASEMENTAREA_MEDI, na.rm = TRUE)),
+      BASEMENTAREA_MODE = replace_na(BASEMENTAREA_MODE, median(BASEMENTAREA_MODE, na.rm = TRUE)),
+      COMMONAREA_AVG = replace_na(COMMONAREA_AVG, median(COMMONAREA_AVG, na.rm = TRUE)),
+      COMMONAREA_MEDI = replace_na(COMMONAREA_MEDI, median(COMMONAREA_MEDI, na.rm = TRUE)),
+      ENTRANCES_AVG = replace_na(ENTRANCES_AVG, median(ENTRANCES_AVG, na.rm = TRUE)),
+      ENTRANCES_MEDI = replace_na(ENTRANCES_MEDI, median(ENTRANCES_MEDI, na.rm = TRUE)),
+      ENTRANCES_MODE = replace_na(ENTRANCES_MODE, median(ENTRANCES_MODE, na.rm = TRUE)),
+      FLOORSMAX_AVG = replace_na(FLOORSMAX_AVG, median(FLOORSMAX_AVG, na.rm = TRUE)),
+      FLOORSMAX_MEDI = replace_na(FLOORSMAX_MEDI, median(FLOORSMAX_MEDI, na.rm = TRUE)),
+      FLOORSMAX_MODE = replace_na(FLOORSMAX_MODE, median(FLOORSMAX_MODE, na.rm = TRUE)),
+      FLOORSMIN_AVG = replace_na(FLOORSMIN_AVG, median(FLOORSMIN_AVG, na.rm = TRUE)),
+      FLOORSMIN_MEDI = replace_na(FLOORSMIN_MEDI, median(FLOORSMIN_MEDI, na.rm = TRUE)),
+      FLOORSMIN_MODE = replace_na(FLOORSMIN_MODE, median(FLOORSMIN_MODE, na.rm = TRUE)),
+      LANDAREA_AVG = replace_na(LANDAREA_AVG, median(LANDAREA_AVG, na.rm = TRUE)),
+      LANDAREA_MEDI = replace_na(LANDAREA_MEDI, median(LANDAREA_MEDI, na.rm = TRUE)),
+      LANDAREA_MODE = replace_na(LANDAREA_MODE, median(LANDAREA_MODE, na.rm = TRUE)),
+      LIVINGAPARTMENTS_AVG = replace_na(LIVINGAPARTMENTS_AVG, median(LIVINGAPARTMENTS_AVG, na.rm = TRUE)),
+      LIVINGAPARTMENTS_MEDI = replace_na(LIVINGAPARTMENTS_MEDI, median(LIVINGAPARTMENTS_MEDI, na.rm = TRUE)),
+      LIVINGAPARTMENTS_MODE = replace_na(LIVINGAPARTMENTS_MODE, median(LIVINGAPARTMENTS_MODE, na.rm = TRUE)),
+      LIVINGAREA_AVG = replace_na(LIVINGAREA_AVG, median(LIVINGAREA_AVG, na.rm = TRUE)),
+      LIVINGAREA_MEDI = replace_na(LIVINGAREA_MEDI, median(LIVINGAREA_MEDI, na.rm = TRUE)),
+      LIVINGAREA_MODE = replace_na(LIVINGAREA_MODE, median(LIVINGAREA_MODE, na.rm = TRUE)),
+      NONLIVINGAPARTMENTS_AVG = replace_na(NONLIVINGAPARTMENTS_AVG, median(NONLIVINGAPARTMENTS_AVG, na.rm = TRUE)),
+      NONLIVINGAPARTMENTS_MEDI = replace_na(NONLIVINGAPARTMENTS_MEDI, median(NONLIVINGAPARTMENTS_MEDI, na.rm = TRUE)),
+      NONLIVINGAPARTMENTS_MODE = replace_na(NONLIVINGAPARTMENTS_MODE, median(NONLIVINGAPARTMENTS_MODE, na.rm = TRUE)),
+      NONLIVINGAREA_AVG = replace_na(NONLIVINGAREA_AVG, median(NONLIVINGAREA_AVG, na.rm = TRUE)),
+      NONLIVINGAREA_MEDI = replace_na(NONLIVINGAREA_MEDI, median(NONLIVINGAREA_MEDI, na.rm = TRUE)),
+      NONLIVINGAREA_MODE = replace_na(NONLIVINGAREA_MODE, median(NONLIVINGAREA_MODE, na.rm = TRUE)),
+      TOTALAREA_MODE = replace_na(TOTALAREA_MODE, median(TOTALAREA_MODE, na.rm = TRUE)),
+      YEARS_BEGINEXPLUATATION_AVG = replace_na(YEARS_BEGINEXPLUATATION_AVG, median(YEARS_BEGINEXPLUATATION_AVG, na.rm = TRUE)),
+      YEARS_BEGINEXPLUATATION_MEDI = replace_na(YEARS_BEGINEXPLUATATION_MEDI, median(YEARS_BEGINEXPLUATATION_MEDI, na.rm = TRUE)),
+      YEARS_BEGINEXPLUATATION_MODE = replace_na(YEARS_BEGINEXPLUATATION_MODE, median(YEARS_BEGINEXPLUATATION_MODE, na.rm = TRUE)),
+      YEARS_BUILD_AVG = replace_na(YEARS_BUILD_AVG, median(YEARS_BUILD_AVG, na.rm = TRUE)),
+      YEARS_BUILD_MEDI = replace_na(YEARS_BUILD_MEDI, median(YEARS_BUILD_MEDI, na.rm = TRUE)),
+      YEARS_BUILD_MODE = replace_na(YEARS_BUILD_MODE, median(YEARS_BUILD_MODE, na.rm = TRUE)),
+      EMERGENCYSTATE_MODE = ifelse(
+        "EMERGENCYSTATE_MODE" %in% colnames(df),
+        replace_na(
+          EMERGENCYSTATE_MODE, 
+          names(sort(table(EMERGENCYSTATE_MODE), decreasing = TRUE))[1]
+        ),
+        EMERGENCYSTATE_MODE
+      )
+    )
+}
+
+# Apply imputation function and clean the data for training set
+train <- train %>%
+  app_imputation() %>%
+  quick_clean()
+
+# Apply imputation function and clean the data for testing set
+test <- test %>%
+  app_imputation() %>%
+  quick_clean()
+```
+
+In this section, we focused on addressing missing values (NAs) within our dataset. We used the `app_imputation` function to replace the missing values for several numerical variables with the median value of the respective columns, ensuring that these imputed values made more sense than simply setting them to 0.0 by default. However, we noticed that the `EMERGENCYSTATE_MODE` variable was not properly updated by the `app_imputation` function. As a result, we specifically handled this variable after applying the imputation function by filling the missing values with the most frequent value (mode) of the `EMERGENCYSTATE_MODE` column. This approach allowed us to avoid arbitrary imputations and ensured more meaningful values for the model. Finally, we applied the `quick_clean` function to finalize the dataset's preprocessing.
+
+
+# Feature Engineering
+
+```{r feature_engineering}
+# Aggregate the bureau dataset to count active credit records per SK_ID_CURR
+bureau_agg <- read.csv("bureau.csv") %>%
+  quick_clean() %>%
+  group_by(SK_ID_CURR) %>%
+  summarise(
+    CREDIT_ACTIVE_COUNT = n(),
+    CREDIT_DAY_OVERDUE_SUM = sum(CREDIT_DAY_OVERDUE),  # Commented as 99% of values were 0
+    AMT_CREDIT_SUM_DEBT_SUM = sum(AMT_CREDIT_SUM_DEBT),
+    AMT_CREDIT_SUM_OVERDUE_SUM = sum(AMT_CREDIT_SUM_OVERDUE),
+    CREDIT_OVERDUE_MAX = max(CREDIT_DAY_OVERDUE)  # Commented as 99% of values were 0
+  )
+
+# Aggregate the previous_application dataset to count total applications 
+# and calculate the average credit amount per SK_ID_CURR
+previous_application_agg <- read.csv("previous_application.csv") %>%
+  mutate(NAME_TYPE_SUITE = replace_na(data = NAME_TYPE_SUITE, replace = "Unaccompanied")) %>%
+  quick_clean() %>%
+  group_by(SK_ID_CURR) %>%
+  summarise(
+    PREVIOUS_APPLICATIONS_COUNT = n(),
+    AMT_ANNUITY_SUM = sum(AMT_ANNUITY), 
+    AMT_APPLICATION_SUM = sum(AMT_APPLICATION), 
+    AMT_CREDIT_SUM = sum(AMT_CREDIT), 
+    AMT_DOWN_PAYMENT_SUM = sum(AMT_DOWN_PAYMENT), 
+    AMT_GOODS_PRICE_SUM = sum(AMT_GOODS_PRICE), 
+    RATE_DOWN_PAYMENT_SUM = sum(RATE_DOWN_PAYMENT), 
+    CNT_PAYMENT_SUM = sum(CNT_PAYMENT),
+    RATE_INTEREST_PRIMARY_AVG = mean(RATE_INTEREST_PRIMARY), 
+    AMT_CREDIT_AVG = mean(AMT_CREDIT)
+  )
+
+# Aggregate the pos_cash_balance dataset to calculate the average months balance per SK_ID_CURR
+pos_cash_balance_agg <- read.csv("POS_CASH_balance.csv") %>%
+  quick_clean() %>%
+  group_by(SK_ID_CURR) %>%
+  summarise(
+    CNT_INSTALMENT_FUTURE_SUM = sum(CNT_INSTALMENT_FUTURE), 
+    SK_DPD_SUM = sum(SK_DPD),
+    MONTHS_BALANCE_AVG = mean(MONTHS_BALANCE)
+  )
+
+# Aggregate the credit_card_balance dataset to calculate the average balance per SK_ID_CURR
+credit_card_balance_agg <- read.csv("credit_card_balance.csv") %>%
+  quick_clean() %>%
+  group_by(SK_ID_CURR) %>%
+  summarise(
+    AMT_DRAWINGS_ATM_CURRENT_SUM = sum(AMT_DRAWINGS_ATM_CURRENT), 
+    AMT_DRAWINGS_OTHER_CURRENT_SUM = sum(AMT_DRAWINGS_OTHER_CURRENT), 
+    AMT_DRAWINGS_POS_CURRENT_SUM = sum(AMT_DRAWINGS_POS_CURRENT), 
+    AMT_PAYMENT_CURRENT_SUM = sum(AMT_PAYMENT_CURRENT), 
+    CNT_DRAWINGS_ATM_CURRENT_SUM = sum(CNT_DRAWINGS_ATM_CURRENT), 
+    CNT_DRAWINGS_OTHER_CURRENT_SUM = sum(CNT_DRAWINGS_OTHER_CURRENT), 
+    CNT_DRAWINGS_POS_CURRENT_SUM = sum(CNT_DRAWINGS_POS_CURRENT), 
+    CNT_INSTALMENT_MATURE_CUM_SUM = sum(CNT_INSTALMENT_MATURE_CUM),
+    AMT_BALANCE_AVG = mean(AMT_BALANCE)
+  )
+
+# Aggregate the installments_payments dataset to calculate the average days installment per SK_ID_CURR
+installments_payments_agg <- read.csv("installments_payments.csv") %>%
+  quick_clean() %>%
+  mutate(
+    DAYS_LATE = DAYS_INSTALMENT - DAYS_ENTRY_PAYMENT, 
+    PAYMENT_DIFFERENCE = AMT_INSTALMENT - AMT_PAYMENT
+  ) %>%
+  group_by(SK_ID_CURR) %>%
+  summarise(
+    DAYS_INSTALMENT_AVG = mean(DAYS_INSTALMENT),
+    DAYS_LATE_AVG = mean(DAYS_LATE), 
+    PAYMENT_DIFFERENCE_AVG = mean(PAYMENT_DIFFERENCE)
+  )
+```
+
+In this section, we aggregated data from several datasets to summarize key financial metrics per applicant (SK_ID_CURR). We cleaned the data using the `quick_clean` function and performed grouping by `SK_ID_CURR` to calculate various summary statistics, such as sums, averages, and counts for different financial indicators. For example, we aggregated data related to credit records, previous applications, POS cash balances, credit card balances, and installment payments. Some variables were further modified, like replacing missing values in certain columns, and we handled specific calculations such as days late and payment differences. This aggregation process helped create a more manageable dataset for further analysis and modeling. Next, we will join these aggregated datasets to our main train and test datasets to integrate these features for our predictive model.
+
+```{r joining_data_aggregations}
+# Merge into Main Train Data
+train <- train %>%
+  left_join(bureau_agg, by = "SK_ID_CURR") %>%
+  left_join(previous_application_agg, by = "SK_ID_CURR") %>%
+  left_join(pos_cash_balance_agg, by = "SK_ID_CURR") %>%
+  left_join(credit_card_balance_agg, by = "SK_ID_CURR") %>%
+  left_join(installments_payments_agg, by = "SK_ID_CURR")
+
+## Merge into Main Test Data
+test <- test %>%
+  left_join(bureau_agg, by = "SK_ID_CURR") %>%
+  left_join(previous_application_agg, by = "SK_ID_CURR") %>%
+  left_join(pos_cash_balance_agg, by = "SK_ID_CURR") %>%
+  left_join(credit_card_balance_agg, by = "SK_ID_CURR") %>%
+  left_join(installments_payments_agg, by = "SK_ID_CURR")
+
+# Re-clean na values as the preceding left merge will introduce more
+# Including low variability column filtering here as well
+train <- train %>%
+  quick_clean() %>%
+  filter_low_variability(exclude_col = "TARGET", threshold = 91)
+
+test <- test %>%
+  quick_clean()
+
+validate_imbalances(train)
+
+# Ensure both sets have the same features (beside TARGET on the training set)
+common_features <- intersect(names(train), names(test))
+train <- train[, c(common_features, "TARGET")]
+test <- test[, common_features]
+```
+
+```{r rm_temp_0, include=FALSE}
+# Removing residual aggregated datasets for runtime performance.
+rm(bureau_agg)
+rm(previous_application_agg)
+rm(pos_cash_balance_agg)
+rm(credit_card_balance_agg)
+rm(installments_payments_agg)
+gc()
+```
+
+In this code, we first clean the training and test datasets by addressing missing values using the `quick_clean` function. For the training set, we also filter out columns with low variability (excluding the "TARGET" column) based on a threshold of 91%. Then, we validate any class imbalances in the training data with the `validate_imbalances` function. Finally, we ensure that both the training and test datasets have the same features by selecting the common columns and aligning them, while retaining the "TARGET" column in the training set.
+
+
+# Post-Cleaning Data Evaluation
+
+Here we perform a few post-cleaning validations on the dataset. We checks for any remaining missing values and provides a general summary of the data using `skim()`. Additionally, we scale our numerical predictors in preparation for modeling, excluding the `SK_ID_CURR` column, which is not relevant for the transformation. This step ensures the data is appropriately prepped for subsequent model building.
+
+```{r post_cleaning_evaluation}
+# Skim through the training dataset to get a summary of the variables
+skim(train)
+
+# Scale the numerical predictors in the training set in preparation for modeling
+train <- train %>%
+  mutate(across(where(is.numeric), ~ as.vector(scale(.)))) %>%
+  select(-SK_ID_CURR)
+
+# Scale the numerical predictors in the test set (excluding the SK_ID_CURR column)
+test <- test %>%
+  mutate(across(where(is.numeric) & !all_of("SK_ID_CURR"), ~ as.vector(scale(.))))
+```
+
+
+# Majority Class Model AUC Evaluation
+
+In this section, we begin by evaluating the performance of our baseline model, the Majority Class Model, to establish a minimum benchmark for our predictive efforts. This model serves as a simple reference point, predicting only the majority class. By understanding its limitations, we can set clear goals for improving our model’s ability to effectively predict both classes and enhance performance metrics such as the project's designated AUC score.
+
+```{r majority_class_evaluation}
+# Find the majority class and calculate the proportion of the TARGET variable
+train %>%
+  count(TARGET) %>%
+  mutate(
+    proportion = round((n / sum(n)) * 100, 2),
+    majority_class = if_else((n / sum(n)) >= 0.5, TRUE, FALSE)
+  )
+
+# Visualize the distribution of the TARGET variable
+ggplot(train, aes(x = as.factor(TARGET))) +
+  geom_bar(fill = "indianred4") +
+  labs(title = "Loan Repayment vs. Default", x = "TARGET (0 = Repaid, 1 = Defaulted)", y = "Count") +
+  theme_minimal()
+
+# Majority Class Model AUC Evaluation
+# Convert the TARGET variable to numeric (0 or 1) if it was previously a character or factor
+target_vector <- if_else(train$TARGET == "Yes", 1, 0)
+
+# Identify the majority class in the training set based on the target variable's distribution
+majority_class <- ifelse(mean(target_vector) > 0.5, 1, 0)
+
+# Generate predictions for the Majority Class Model (constant predictions)
+majority_class_predictions <- rep(majority_class, length(train$TARGET))
+
+# Calculate the ROC curve and AUC for the Majority Class Model
+majority_class_roc <- roc(train$TARGET, as.numeric(majority_class_predictions))
+
+# Calculate AUC for the Majority Class Model
+majority_class_auc <- auc(majority_class_roc)
+
+# Print the AUC score for the Majority Class Model
+print(paste("Majority Class Model Validation AUC:", round(majority_class_auc, 3)))
+plot(majority_class_roc, main="ROC Curve", col="steelblue")
+```
+
+The distribution of the target variable is highly imbalanced, with approximately 92% of the instances belonging to the "No" class and only 8% to the "Yes" class. This uneven distribution significantly affects the Majority Class Model, which predicts the majority class for all instances. The model's validation AUC of 0.5 reflects its inability to distinguish between the two classes, indicating that it performs no better than random guessing. This model serves as our baseline, providing insight into the minimum performance we should expect. Moving forward, our goal is to create a more robust model that can effectively handle this class imbalance, capture meaningful patterns in the data, and ultimately improve the AUC score and prediction accuracy.
+
+
+# Feature Selection
+
+### Selection via XGBoost Importance
+
+In this section, we preprocess the training data by converting the target variable into binary format and transforming categorical features into numeric values suitable for model training. Random OverSampling Examples is used to oversample the minority class to speed up traing and balance the dataset at this stage. Depending on how well these generated features turn out to be in the model assessment stage, using ROSE for the final model is a possibility. We then split the dataset into features and the target variable. Using the XGBoost model, we train on the processed data and calculate feature importance based on the Gain metric. Features with non-zero importance are identified, and the top 25 most important features are selected. Finally, we visualize the importance of these top features using a bar plot, helping to identify which features contribute most to the model's predictions.
+
+```{r feature_selection_xgboost}
+set.seed(24601)
+
+# Convert TARGET to binary (1 for 'Yes', 0 for 'No')
+temp_train <- train %>%
+  mutate(TARGET = if_else(TARGET == "Yes", 1, 0))
+
+# Apply ROSE to balance the target variable distribution in the training set
+ temp_train <- ROSE(TARGET ~ ., data = temp_train, seed = 42)$data
+
+# Display the structure of the training set after applying ROSE
+# str(temp_train)
+
+# Check the class distribution of the target variable to verify balance
+# table(temp_train$TARGET)
+
+# Convert categorical variables to numeric format for model training
+temp_train[] <- lapply(temp_train, function(x) if(is.character(x) || is.factor(x)) as.numeric(as.factor(x)) else x)
+
+# Split the dataset into features (X) and the target variable (y)
+X <- temp_train %>% select(-TARGET)
+y <- temp_train$TARGET
+
+# Ensure the target variable is numeric (0 or 1)
+y <- as.numeric(y)
+
+# Convert features to matrix format for XGBoost model
+X_matrix <- as.matrix(X)
+
+# Train the XGBoost model on the prepared dataset
+dtrain <- xgb.DMatrix(data = X_matrix, label = y)
+param <- list(objective = "binary:logistic", eval_metric = "auc")
+xgb_model <- xgboost(
+  params = param, 
+  data = dtrain, 
+  nrounds = 150, 
+  early_stopping_rounds = 10, 
+  verbose = FALSE
+)
+
+# Get the feature importance from the trained XGBoost model
+importance <- xgb.importance(model = xgb_model)
+
+# Extract features with non-zero importance based on the Gain metric
+xgb_predictors <- importance$Feature[importance$Gain > 0]
+xgb_predictors <- setdiff(xgb_predictors, "TARGET")
+
+# Convert the importance matrix to a dataframe for easier handling
+importance_df <- as.data.frame(importance)
+
+# Extract a list of important features (those with non-zero Gain)
+important_features <- importance$Feature[importance$Gain > 0]
+
+# Print the important features as a vector
+print(important_features)
+
+# Select the top 25 features based on the Gain metric
+top_features <- importance_df %>%
+  arrange(desc(Gain)) %>%
+  head(25)
+
+# Plot the top 25 most important features from the XGBoost model
+ggplot(top_features, aes(x = reorder(Feature, Gain), y = Gain)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  coord_flip() +
+  labs(title = "Top 25 Feature Importance (XGBoost)",
+       x = "Feature",
+       y = "Importance Score") +
+  theme_minimal()
+```
+
+### Selection via Correlation and Variance
+
+The "Feature Selection via Correlation and Variance" section focuses on optimizing the feature set for model training by eliminating redundant and irrelevant variables. It begins by identifying and removing highly correlated features, using a threshold of 0.95, to avoid multicollinearity. Next, it removes features with near-zero variance, which are unlikely to provide meaningful information for model prediction. This process helps enhance model performance by ensuring that only the most informative features are included in the analysis.
+
+```{r feature_selection_corr_var}
+# Compute correlation matrix for numeric features
+numeric_features <- names(train)[sapply(train, is.numeric)]
+cor_matrix <- cor(train[, numeric_features], use = "complete.obs")
+
+# Find highly correlated features with a cutoff of 0.95
+high_corr <- findCorrelation(cor_matrix, cutoff = 0.95)
+
+# Create temporary datasets that exclude highly correlated features
+temp_train <- train[, -high_corr]
+
+# Identify near-zero variance features
+nzv <- nearZeroVar(temp_train, saveMetrics = FALSE)
+
+# Remove near-zero variance features from temporary datasets
+temp_train <- temp_train[, -nzv]
+
+# Get the remaining columns in the dataset after feature removal
+corr_var_predictors <- names(temp_train)
+corr_var_predictors <- setdiff(corr_var_predictors, "TARGET")
+
+# Print the remaining columns for both train and test
+print("Remaining columns in train dataset:")
+print(corr_var_predictors)
+```
+
+```{r rm_temp_1, include=FALSE}
+# Clean up temporary variables to free memory
+invisible(rm(temp_train))
+invisible(gc())
+```
+
+
+# Model Training and Evaluation
+
+### Train-Vaidation Split
+
+```{r train_validation_split}
+# Set the seed for reproducibility of results
+set.seed(24601)
+
+# Convert the 'TARGET' variable from categorical ("Yes"/"No") to numeric (1/0)
+train <- train %>%
+  mutate(TARGET = if_else(TARGET == "Yes", 1, 0))
+
+# Convert all categorical variables to numeric for model compatibility
+train[] <- lapply(train, function(x) 
+  if (is.character(x) || is.factor(x)) 
+    as.numeric(as.factor(x)) 
+  else 
+    x
+)
+
+test[] <- lapply(test, function(x) 
+  if (is.character(x) || is.factor(x)) 
+    as.numeric(as.factor(x)) 
+  else 
+    x
+)
+
+# Split the data into training and validation sets (70% train, 30% validate)
+index_train_test <- createDataPartition(train$TARGET, p = 0.7, list = FALSE)
+train_set <- train[index_train_test, ]  # Training set
+validate_set <- train[-index_train_test, ]  # Validation set
+```
+
+### In-Sample Training and Evaluation
+
+```{r in_sample_training_and_evaluation}
+# Set the seed for reproducibility of results
+set.seed(24601)
+
+# Split the training set into features (X) and the target variable (y)
+X <- train_set %>% select(-TARGET)
+y <- train_set$TARGET
+
+# Convert 'y' to numeric (0 or 1) if it's in a logical format
+y <- as.numeric(y)
+
+# Convert the feature matrix (X) to matrix format for XGBoost
+X_matrix <- as.matrix(X)
+
+# Train the XGBoost model on the training data
+dtrain <- xgb.DMatrix(data = X_matrix, label = y)
+param <- list(objective = "binary:logistic", eval_metric = "auc")
+xgb_model <- xgboost(
+  params = param, 
+  data = dtrain, 
+  nrounds = 150, 
+  early_stopping_rounds = 10, 
+  verbose = FALSE
+)
+
+# Predict probabilities using the XGBoost model for AUC calculation
+xgb_predictions <- predict(xgb_model, X_matrix)
+
+# Compute the AUC for the XGBoost model's predictions
+xgb_roc_curve <- roc(y, xgb_predictions, quiet = TRUE)
+xgb_auc_value <- auc(xgb_roc_curve)
+
+# Print the in-sample AUC value for the XGBoost model, plot the ROC curve, 
+# and compute the confusion matrix to evaluate classification performance.
+print(paste("In-Sample XGBoost AUC: ", round(xgb_auc_value, 4)))
+plot(xgb_roc_curve, main="ROC Curve", col="steelblue")
+confusionMatrix(factor(ifelse(xgb_predictions >= 0.5, 1, 0)), factor(train_set$TARGET))
+
+
+# Train a GLM model using the XGBoost selected predictors on the full training data
+xgb_glm_model <- glm(TARGET ~ ., data = train_set[, c(xgb_predictors, "TARGET")], family = binomial)
+
+# Predict on the training set (used for in-sample evaluation)
+xgb_glm_predictions <- predict(xgb_glm_model, newdata = train_set, type = "response")
+xgb_gl_roc <- roc(train_set$TARGET, xgb_glm_predictions, quiet = TRUE)
+xgb_gl_in_sample_auc <- auc(xgb_gl_roc)
+
+# Print the in-sample AUC value for the XGBoost->GLM model, plot the ROC curve,  
+# and compute the confusion matrix to evaluate classification performance.
+print(paste("In-Sample XGBoost->GLM AUC: ", round(xgb_gl_in_sample_auc, 4)))
+plot(xgb_gl_roc, main="ROC Curve", col="steelblue")
+confusionMatrix(factor(ifelse(xgb_glm_predictions >= 0.5, 1, 0)), factor(train_set$TARGET))
+
+
+# Train a GLM model using the Variance/Correlation selected predictors on the full training data
+var_corr_glm_model <- glm(TARGET ~ ., data = train_set[, c(corr_var_predictors, "TARGET")], family = binomial)
+
+# Predict on the training set (used for in-sample evaluation)
+var_corr_glm_predictions <- predict(var_corr_glm_model, newdata = train_set, type = "response")
+var_corr_glm_roc <- roc(train_set$TARGET, var_corr_glm_predictions, quiet = TRUE)
+var_corr_glm_in_sample_auc <- auc(var_corr_glm_roc)
+
+# Print the in-sample AUC value for the Var/Corr model, plot the ROC curve,  
+# and compute the confusion matrix to evaluate classification performance.
+print(paste("In-Sample Var/Corr AUC: ", round(var_corr_glm_in_sample_auc, 4)))
+plot(var_corr_glm_roc, main="ROC Curve", col="steelblue")
+confusionMatrix(factor(ifelse(var_corr_glm_predictions >= 0.5, 1, 0)), factor(train_set$TARGET))
+```
+
+1. **In-Sample XGBoost AUC: 0.9042**  
+   The XGBoost model delivers an impressive in-sample AUC of 0.9042, indicating excellent performance. This suggests that the model is very effective at fitting the training data and has a strong ability to distinguish between the loan default and non-default classes. However, this high AUC may also suggest potential overfitting, which we would need to watch for during out-of-sample testing. The model demonstrates **high sensitivity (99.84%)**, meaning it correctly identifies most non-default cases. However, its **low specificity (15.09%)** suggests a high false positive rate, meaning it struggles to correctly identify defaults.
+
+2. **In-Sample XGBoost->GLM AUC: 0.7359**  
+   The XGBoost->GLM model shows a much lower in-sample AUC of 0.7359 compared to the standalone XGBoost model. This result suggests that while the GLM helps with generalization, it is less effective at capturing the patterns present in the training data compared to XGBoost alone. The combined model may provide more balanced predictions, but it doesn't fit the training data as well as XGBoost. This model **improves generalization but at the cost of prediction power**. The near-perfect sensitivity (99.95%) means it classifies almost all non-defaults correctly, but its specificity (0.49%) is very low, making it ineffective at catching actual defaults.
+
+3. **In-Sample Var/Corr AUC: 0.7111**  
+   The Var/Corr model produces the lowest in-sample AUC of 0.7111. This result suggests that, even on the training data, the model has a limited ability to discriminate between loan defaults and non-defaults. The performance is relatively modest, indicating that the model might need further refinement, potentially through feature selection or different modeling approaches. The Var/Corr model performs similarly to the XGBoost->GLM model, achieving **near-perfect sensitivity (99.97%) but extremely low specificity (0.19%)**, suggesting it misclassifies almost all defaults.
+
+##### **Conclusion:**
+In the in-sample evaluation:
+- The **XGBoost model** significantly outperforms the other models, achieving the highest AUC and showing strong predictive power. However, its **low specificity** suggests it may overfit and misclassify defaults.
+- The **XGBoost->GLM model** trades off some predictive power for better generalization but still struggles to correctly classify defaults.
+- The **Var/Corr model** remains the weakest performer, with poor discriminatory power and minimal ability to detect defaults.
+
+Further improvements could focus on **better feature selection, tuning decision thresholds, or exploring alternative ensemble models** to improve specificity while maintaining sensitivity.
+
+### Out-of-Sample Evaluation
+
+```{r out_of_sample_evaluation}
+# Set the seed for reproducibility of results
+set.seed(24601)
+
+# Split the validate_set into features (X) and the target variable (y)
+X <- validate_set %>% select(-TARGET)
+y <- validate_set$TARGET
+
+# Convert 'y' to numeric (0 or 1) if it's logical
+y <- as.numeric(y)
+
+# Convert features to matrix format for XGBoost prediction
+X_matrix <- as.matrix(X)
+
+# Predict probabilities for the AUC calculation using the XGBoost model
+xgb_predictions <- predict(xgb_model, X_matrix)
+
+# Compute the ROC curve and AUC for the XGBoost model on the validation set
+xgb_roc_curve <- roc(y, xgb_predictions, quiet = TRUE)  # Generate ROC curve
+xgb_auc_value <- auc(xgb_roc_curve)
+
+# Print the out-of-sample AUC value for the XGBoost model, plot the ROC curve, 
+# and compute the confusion matrix to evaluate classification performance.
+print(paste("Out-of-Sample XGBoost AUC: ", round(xgb_auc_value, 4)))
+plot(xgb_roc_curve, main="ROC Curve", col="steelblue")
+confusionMatrix(factor(ifelse(xgb_predictions >= 0.5, 1, 0)), factor(validate_set$TARGET))
+
+# Predict on the validation set using the XGBoost->GLM model (for out-of-sample evaluation)
+xgb_glm_predictions <- predict(xgb_glm_model, newdata = validate_set, type = "response")
+xgb_glm_roc <- roc(validate_set$TARGET, xgb_glm_predictions, quiet = TRUE)  # Generate ROC curve
+xgb_glm_out_of_sample_auc <- auc(xgb_glm_roc)
+
+# Print the out-of-sample AUC value for the XGBoost->GLM model, plot the ROC curve,  
+# and compute the confusion matrix to evaluate classification performance.
+print(paste("Out-of-Sample XGBoost->GLM AUC: ", round(xgb_glm_out_of_sample_auc, 4)))
+plot(xgb_glm_roc, main="ROC Curve", col="steelblue")
+confusionMatrix(factor(ifelse(xgb_glm_predictions >= 0.5, 1, 0)), factor(validate_set$TARGET))
+
+
+# Predict on the validation set using the Var/Corr model (for out-of-sample evaluation)
+var_corr_glm_predictions <- predict(var_corr_glm_model, newdata = validate_set, type = "response")
+var_corr_glm_roc <- roc(validate_set$TARGET, var_corr_glm_predictions, quiet = TRUE)  # Generate ROC curve
+var_corr_glm_out_of_sample_auc <- auc(var_corr_glm_roc)  # Compute AUC value
+
+# Print the out-of-sample AUC value for the Var/Corr model, plot the ROC curve,  
+# and compute the confusion matrix to evaluate classification performance.
+print(paste("Out-of-Sample Var/Corr AUC: ", round(var_corr_glm_out_of_sample_auc, 4)))
+plot(var_corr_glm_roc, main="ROC Curve", col="steelblue")
+confusionMatrix(factor(ifelse(var_corr_glm_predictions >= 0.5, 1, 0)), factor(validate_set$TARGET))
+```
+
+1. **Out-of-Sample XGBoost AUC: 0.7518**  
+   The XGBoost model achieves an AUC of 0.7518 in the out-of-sample evaluation. While this score is lower than the in-sample AUC, it still suggests reasonable predictive capability. The confusion matrix shows a strong sensitivity (0.9945), meaning the model effectively identifies non-default cases. However, its specificity (0.0486) is quite low, indicating a struggle in correctly identifying actual default cases. The balanced accuracy of 0.5215 suggests the model is only slightly better than random classification for distinguishing defaults.
+
+2. **Out-of-Sample XGBoost->GLM AUC: 0.7359**  
+   The XGBoost->GLM model produces an AUC of 0.7359, slightly lower than the standalone XGBoost model. While sensitivity remains high (0.9995), specificity is significantly low (0.0047), meaning the model has an extreme bias toward predicting non-default cases. This is reflected in its balanced accuracy of 0.5021, indicating it barely improves upon random classification in identifying defaults. The model's overall accuracy of 91.76% is misleading given its limited ability to correctly classify default cases.
+
+3. **Out-of-Sample Var/Corr AUC: 0.7106**  
+   The Var/Corr model yields the lowest AUC at 0.7106, reflecting its relatively weak performance. While it maintains a very high sensitivity (0.9997), its specificity (0.0037) is nearly negligible, meaning it struggles significantly to identify defaults. This results in a balanced accuracy of 0.5017, which is close to random chance. The model's performance suggests that further refinements, such as feature selection or adjustments to classification thresholds, may be necessary.
+
+##### **Conclusion:**
+In the out-of-sample evaluation:
+- The **XGBoost model** maintains its superiority over the other models but experiences a noticeable drop in performance compared to the in-sample results. While it remains effective at identifying non-defaults, its ability to correctly classify defaults is still weak.
+- The **XGBoost->GLM model** shows a similar trend, with a slight decline in predictive power and a strong bias toward non-default classification.
+- The **Var/Corr model** continues to perform the worst, showing only marginal improvement over random guessing.
+
+To improve performance in real-world applications, further **model tuning, feature engineering, and threshold adjustments** are recommended to enhance default classification and generalization.
+
+
+# Final Model Selection
+
+Based on the evaluation results, we have selected the XGBoost model for loan default prediction due to its superior out-of-sample AUC of 0.7522, which outperforms both the XGBoost->GLM model (AUC: 0.7359) and the Var/Corr model (AUC: 0.7106). The higher AUC indicates that the XGBoost model is better at distinguishing between default and non-default cases, providing more accurate predictions. By training the model on historical data, such as customer demographics, financial history, and loan characteristics, it can identify patterns that signal potential risks and predict the likelihood of a borrower defaulting. This model can be integrated into Home Credit’s decision-making process, automating the evaluation of new loan applications. It would score applicants based on their risk level, allowing Home Credit to make more informed and efficient lending decisions. By accurately predicting defaults, the model will help mitigate financial risk, optimize lending strategies, and reduce losses from bad loans, ultimately improving profitability. Additionally, continuous updates to the model using fresh data will help Home Credit adapt to changing economic conditions and customer behaviors.
+
+```{r final_model_selection_training}
+# Set the seed for reproducibility of results
+set.seed(24601)
+
+# Split the train_set into features (X) and the target variable (y)
+X <- train %>% select(-TARGET)
+y <- train$TARGET
+
+# Convert 'y' to numeric (0 or 1) if it's logical
+y <- as.numeric(y)
+
+# Convert features to matrix format for XGBoost
+X_matrix <- as.matrix(X)
+
+# Train the XGBoost model using binary logistic regression and AUC as evaluation metric
+dtrain <- xgb.DMatrix(data = X_matrix, label = y)  # Create DMatrix for training
+param <- list(objective = "binary:logistic", eval_metric = "auc")  # Model parameters
+final_model <- xgboost(
+  params = param, 
+  data = dtrain, 
+  nrounds = 150,
+  early_stopping_rounds = 10,
+  verbose = FALSE
+)
+
+# Predict probabilities for the training set to compute AUC
+final_in_sample_predictions <- predict(final_model, X_matrix)
+
+# Compute the AUC (Area Under the Curve) for model evaluation
+xgb_roc_curve <- roc(y, final_in_sample_predictions, quiet = TRUE)  # Generate ROC curve
+xgb_auc_value <- auc(xgb_roc_curve)  # Compute AUC value
+
+# Print the final AUC value for in-sample performance
+print(paste("Final In-Sample XGBoost AUC: ", round(xgb_auc_value, 4)))
+plot(xgb_roc_curve, main="ROC Curve", col="steelblue")
+```
+
+### Kaggle Submission and Results
+
+```{r kaggle_submission_and_results}
+# Extract the unique IDs (SK_ID_CURR) from the test set
+ids <- test$SK_ID_CURR
+
+# Prepare the feature matrix (excluding the SK_ID_CURR column)
+X_matrix <- test %>% 
+  select(-SK_ID_CURR) %>%  # Exclude SK_ID_CURR column
+  as.matrix()  # Convert to matrix format for prediction
+
+# Get predicted probabilities from the XGBoost model (same format as glm)
+xgb_predictions <- predict(final_model, X_matrix)
+
+# Create a dataframe for the Kaggle submission with SK_ID_CURR and predicted probabilities (TARGET)
+kaggle_submission <- data.frame(SK_ID_CURR = ids, TARGET = xgb_predictions)
+
+# Print the first few rows of the submission dataframe to check the predictions
+head(kaggle_submission)
+
+# Write the submission dataframe to a CSV file (without row names)
+write.csv(kaggle_submission, "kaggle_submission.csv", row.names = FALSE)
+```
+
+##### Kaggle Results
+
+- Private Score: 0.72251
+- Public Score: 0.71872
+
+Our selected XGBoost model performed well in the Kaggle competition, achieving a Private Score of 0.72251 and a Public Score of 0.71872. The close alignment between the private and public scores suggests that the model is robust and generalizes effectively across both the competition’s training and testing datasets. The solid AUC scores indicate that our model performs well in distinguishing between default and non-default cases, with consistent performance across different sets. This reinforces the reliability of our approach for predicting loan defaults probabilities, and highlights its potential for practical use in real-world applications where similar accuracy is critical.
+
+It is important to note that while our scores are promising, there remains potential for further refinement and enhancement of both the model and its predictive capabilities. In a professional setting, an AUC closer to 0.90 or higher would be ideal for effectively predicting loan defaults and ensuring strong model performance across diverse datasets. However, it is worth noting that the top Kaggle scores in this competition only reached around 0.80, so our performance remains competitive and demonstrates solid progress.
+

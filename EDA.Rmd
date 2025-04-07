@@ -102,26 +102,22 @@ print(target_distribution)
 ```
 
 ```{r message=FALSE, warning=FALSE}
-# Calculate percentages
-target_percent <- train %>%
-  count(TARGET) %>%
-  mutate(Percent = n / sum(n) * 100,
-         TARGET = factor(TARGET, labels = c("Repaid", "Defaulted")))
+options(repr.plot.width = 4, repr.plot.height = 3)  # adjust as needed
 
-# Plot
+# Then run your plot
 ggplot(target_percent, aes(x = TARGET, y = Percent)) +
-  geom_bar(stat = "identity", fill = "steelblue4") +
+  geom_bar(stat = "identity", fill = "steelblue4", width = 0.7) +
   geom_text(aes(label = paste0(round(Percent, 1), "%")), 
-            vjust = -0.5, size = 6) +  # larger label size
+            vjust = -0.5, size = 5) +
   labs(title = "Loan Repayment vs. Default (as % of Total)",
        x = "Loan Status",
        y = "Percentage (%)") +
-  theme_minimal(base_size = 16) +  # larger base font
+  theme_minimal(base_size = 14) +
   theme(
     panel.grid.major = element_blank(),
     panel.grid.minor = element_blank(),
-    axis.title = element_text(size = 18),
-    plot.title = element_text(size = 20, face = "bold", hjust = 0.5)
+    axis.title = element_text(size = 16),
+    plot.title = element_text(size = 18, face = "bold", hjust = 0.5)
   )
 
 ```

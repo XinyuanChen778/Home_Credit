@@ -1,0 +1,217 @@
+---
+title: "Home Credit Predictive Models: R"
+author: "Xinyuan Chen"
+date: "2025-03-09"
+output: 
+  html_document:
+    theme: simplex
+    code_folding: 
+    toc: yes
+    toc_float:
+      collapsed: true
+---
+# Data Import and Checking
+
+## Load Libraries
+```{r message=FALSE, warning=FALSE}
+library(data.table)
+library(caret)
+library(glmnet)       # Lasso for Logistic Regression
+library(randomForest) # Random Forest
+library(xgboost)      # XGBoost
+library(e1071)        # SVM
+library(keras)        # Neural Network
+library(rpart)        # Decision Tree
+library(rpart.plot)
+library(DALEX)       
+library(readr)
+library(dplyr)
+library(ROSE)
+library(pROC)         # For AUC evaluation
+```
+
+## Data Import
+```{r message=FALSE, warning=FALSE}
+train <- read_csv("merged_train.csv")  
+test <- read_csv("merged_test.csv")
+```
+
+## Check Missing
+```{r message=FALSE, warning=FALSE}
+colSums(is.na(train))
+```
+
+# Data Cleaning and Preparation
+
+## Handling Extra or Missing Columns
+```{r message=FALSE, warning=FALSE}
+# Find extra columns in test that are not in train
+extra_columns <- setdiff(names(test), names(train))
+missing_columns <- setdiff(names(train), names(test))
+
+print(paste("Extra columns in test:", paste(extra_columns, collapse = ", ")))
+print(paste("Missing columns in test:", paste(missing_columns, collapse = ", ")))
+
+```
+
+```{r message=FALSE, warning=FALSE}
+extra_columns <- c("EXT_SOURCE_1", "APARTMENTS_AVG", "ENTRANCES_AVG", "LIVINGAREA_AVG", 
+                   "APARTMENTS_MODE", "ENTRANCES_MODE", "LIVINGAREA_MODE", 
+                   "APARTMENTS_MEDI", "ENTRANCES_MEDI", "LIVINGAREA_MEDI", 
+                   "HOUSETYPE_MODE", "WALLSMATERIAL_MODE")
+
+# remove extra
+test <- test %>% select(-all_of(extra_columns))
+```
+
+## Check All Variable Names
+```{r message=FALSE, warning=FALSE}
+# Get column names
+train_cols <- names(train)
+test_cols <- names(test)
+
+print(train_cols)
+print(test_cols)
+```
+
+
+## Feature Selection
+
+### Remove Highly Correlated Features
+```{r message=FALSE, warning=FALSE}
+# Compute correlation matrix
+numeric_features <- names(train)[sapply(train, is.numeric)]  # Only numeric columns
+cor_matrix <- cor(train[, numeric_features, with = FALSE], use = "complete.obs")
+
+# Find highly correlated features
+high_corr <- findCorrelation(cor_matrix, cutoff = 0.95)
+train <- train[, -high_corr, with = FALSE]
+test <- test[, -high_corr, with = FALSE]
+```
+
+### Remove Low-Variance Features
+```{r message=FALSE, warning=FALSE}
+# Identify near-zero variance features
+nzv <- nearZeroVar(train, saveMetrics = FALSE)  # Returns column indices, NOT logical vector
+
+# Remove NZV features from train and test
+train <- train[, -nzv, with = FALSE]
+test <- test[, -nzv, with = FALSE]
+```
+
+```{r message=FALSE, warning=FALSE}
+str(train$TARGET)  # If it shows Factor, you need conversion
+```
+
+# Model Training and Evaluation
+
+## Train-Validation Split
+
+```{r message=FALSE, warning=FALSE}
+set.seed(42)
+train_index <- createDataPartition(train$TARGET, p = 0.8, list = FALSE)
+train_set <- train[train_index,]
+valid_set <- train[-train_index,]
+```
+
+```{r}
+# Exclude ID column (if present)
+train_set <- train_set[, !colnames(train_set) %in% c("SK_ID_CURR")]
+
+# Convert character columns to factors
+factor_cols <- sapply(train_set, is.character)
+train_set[, factor_cols] <- lapply(train_set[, factor_cols], as.factor)
+```
+
+## Data Balancing using ROSE
+```{r message=FALSE, warning=FALSE}
+train_set <- ROSE(TARGET ~ ., data = train_set, seed = 42)$data
+```
+
+```{r message=FALSE, warning=FALSE}
+# Ensure train_set is a data.table
+setDT(train_set)
+setDT(valid_set)
+
+# Define features correctly
+target_col <- "TARGET"
+features <- setdiff(names(train_set), target_col)
+
+# Convert train and validation sets to matrices
+X_train <- as.matrix(train_set[, ..features]) 
+X_valid <- as.matrix(valid_set[, ..features])  
+
+# Extract target variable
+y_train <- train_set[[target_col]]
+y_valid <- valid_set[[target_col]]
+
+```
+
+# Models
+
+## XGBoost
+
+```{r message=FALSE, warning=FALSE}
+# Convert categorical variables to numeric
+train_set[] <- lapply(train_set, function(x) if(is.character(x) || is.factor(x)) as.numeric(as.factor(x)) else x)
+valid_set[] <- lapply(valid_set, function(x) if(is.character(x) || is.factor(x)) as.numeric(as.factor(x)) else x)
+
+# Ensure both sets have the same features
+common_features <- intersect(names(train_set), names(valid_set))
+train_set <- train_set[, ..common_features]
+valid_set <- valid_set[, ..common_features]
+
+# Create XGBoost matrices
+dtrain <- xgb.DMatrix(data = as.matrix(train_set[, -"TARGET", with=FALSE]), label = train_set$TARGET)
+dvalid <- xgb.DMatrix(data = as.matrix(valid_set[, -"TARGET", with=FALSE]), label = valid_set$TARGET)
+
+params <- list(
+  objective = "binary:logistic",
+  eval_metric = "auc",
+  max_depth = 6,
+  eta = 0.1
+)
+
+xgb_model <- xgb.train(params, dtrain, nrounds = 100, watchlist = list(valid = dvalid), early_stopping_rounds = 10)
+
+```
+## Model Training: Logistic Regression  (Confusion Matrix-based Evaluation)
+```{r message=FALSE, warning=FALSE}
+logistic_model <- glm(TARGET ~ ., data = train_set, family = binomial)
+logistic_preds <- predict(logistic_model, valid_set, type = "response")
+logistic_roc <- roc(valid_set$TARGET, logistic_preds)
+logistic_auc <- auc(logistic_roc)
+
+print(paste("Logistic Regression Validation AUC:", round(logistic_auc, 3)))
+```
+
+## Model Training: Logistic Regression (AUC-based Evaluation)
+```{r}
+# Train Logistic Regression Model
+set.seed(123)
+log_model <- glm(TARGET ~ ., data = train_set, family = binomial)
+
+# Make Predictions
+log_preds <- predict(log_model, newdata = valid_set, type = "response")
+
+# Convert probabilities to binary
+log_class <- ifelse(log_preds > 0.5, 1, 0)
+
+# Model Evaluation
+conf_matrix_log <- confusionMatrix(as.factor(log_class), as.factor(valid_set$TARGET))
+print(conf_matrix_log)
+
+```
+## Model Training: Decision Tree
+```{r}
+dt_model <- rpart(TARGET ~ ., data = train_set, method = "class", control = rpart.control(cp = 0.001, minsplit = 10, maxdepth = 10))
+
+dt_preds <- predict(dt_model, valid_set, type = "prob")[,2]
+dt_roc <- roc(valid_set$TARGET, dt_preds)
+dt_auc <- auc(dt_roc)
+
+print(paste("Decision Tree Validation AUC:", round(dt_auc, 3)))
+
+# Plot the Decision Tree
+rpart.plot(dt_model, type = 2, extra = 101, tweak = 1.2)
+```

@@ -2,21 +2,54 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Home Credit Project</title>
+  <title>Home Credit Loan Repayment Prediction</title>
 </head>
-<body>
-  <h1>Welcome to My Home Credit Project</h1>
-  <p>This project analyzes and predicts loan repayment behaviors using machine learning models.</p>
+<body style="font-family: Arial, sans-serif; line-height: 1.6; padding: 20px; max-width: 800px; margin: auto;">
 
-  <h2>Highlights</h2>
+  <h1>Home Credit Loan Repayment Prediction</h1>
+
+  <h2>Project Overview</h2>
+  <p>
+    Home Credit Group offers financial services to people with limited or no credit history. 
+    To improve the approval process and manage risk, this project develops a predictive model 
+    that uses alternative data sources such as telecom, transactional, and behavioral information.
+  </p>
+
+  <h2>Business Problem</h2>
   <ul>
-    <li>Data cleaning and feature engineering</li>
-    <li>Built predictive models using LightGBM and XGBoost</li>
-    <li>Designed a real-time scoring system</li>
+    <li>Reduce the approval of high-risk loans to lower default rates.</li>
+    <li>Identify and approve more creditworthy applicants to promote financial inclusion.</li>
+    <li>Enhance operational efficiency through data-driven decision-making.</li>
   </ul>
 
-  <h2>Explore the Code</h2>
-  <p>Visit the <a href="https://github.com/xinyuanchen778/Home_Credit" target="_blank">GitHub Repository</a> for full details!</p>
+  <h2>Solution Approach</h2>
+  <ol>
+    <li><strong>Data Exploration:</strong> Analyzed datasets like <code>application_train</code>, <code>bureau</code>, <code>POS_CASH_balance</code>, and <code>credit_card_balance</code>.</li>
+    <li><strong>Feature Engineering:</strong> Created features based on payment patterns, credit usage, and behavioral trends.</li>
+    <li><strong>Model Development:</strong> Built and tuned predictive models using LightGBM and XGBoost algorithms.</li>
+    <li><strong>Deployment Preparation:</strong> Designed a system capable of real-time loan application predictions.</li>
+  </ol>
+
+  <h2>Success Metrics</h2>
+  <ul>
+    <li>High model accuracy in predicting repayment behavior.</li>
+    <li>Reduction in loan defaults.</li>
+    <li>Increase in approved loans for reliable applicants.</li>
+  </ul>
+
+  <h2>Deliverables</h2>
+  <ul>
+    <li>Exploratory data analysis and feature engineering report.</li>
+    <li>Full modeling code and scripts for predictions.</li>
+    <li>Deployment-ready predictive model.</li>
+  </ul>
+
+  <h2>Team Members</h2>
+  <ul>
+    <li>Xinyuan Chen</li>
+    <li>Sterling LeDuc</li>
+    <li>Robby Stohel</li>
+  </ul>
+
 </body>
 </html>

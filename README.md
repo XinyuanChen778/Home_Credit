@@ -8,7 +8,7 @@
 
   <h1>Xinyuan Chen</h1>
 
-  <p><strong>Email:</strong> your-email@example.com &nbsp; | &nbsp; <strong>LinkedIn:</strong> linkedin.com/in/yourprofile &nbsp; | &nbsp; <strong>GitHub:</strong> <a href="https://github.com/XinyuanChen778" target="_blank">github.com/XinyuanChen778</a></p>
+  <p><strong>Email:</strong> xinyuanchen778@Gmail.com.com &nbsp; | &nbsp; <strong>LinkedIn:</strong> https://www.linkedin.com/in/xinyuan778/ &nbsp; | &nbsp; <strong>GitHub:</strong> <a href="https://github.com/XinyuanChen778" target="_blank">github.com/XinyuanChen778</a></p>
 
   <h2>About Me</h2>
   <p>
